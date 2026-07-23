@@ -112,67 +112,36 @@ def find_section_elements(document):
 # there (broken images, wrong or missing list numbering).
 # ---------------------------------------------------------------------------
 
-def copy_image_relationships(src_doc, dst_doc, element):
-    """Find every image reference (a:blip r:embed=...) inside `element`,
-    copy the underlying image part from src_doc into dst_doc, and rewrite
-    the r:embed attribute to the new relationship id in dst_doc."""
-    r_embed = qn("r:embed")
-    r_link = qn("r:link")
-
-    for blip in element.iter(qn("a:blip")):
-        for attr in (r_embed, r_link):
-            rid = blip.get(attr)
-            if not rid:
-                continue
-            try:
-                image_part = src_doc.part.related_parts[rid]
-            except KeyError:
-                continue
-            image_bytes = image_part.blob
-            content_type = image_part.content_type
-            # Add the image as a new part in the destination document and
-            # get a fresh relationship id valid there.
-            new_rid = dst_doc.part.get_or_add_image_part_relationship(
-                image_bytes, content_type
-            ) if hasattr(dst_doc.part, "get_or_add_image_part_relationship") else None
-
-            if new_rid is None:
-                # python-docx doesn't expose that helper directly; do it
-                # the same way python-docx's own add_picture() does.
-                from docx.parts.image import ImagePart
-                import io
-                image_part_new, new_rid = dst_doc.part.get_or_add_image(
-                    io.BytesIO(image_bytes)
-                ) if hasattr(dst_doc.part, "get_or_add_image") else (None, None)
-
-            blip.set(attr, new_rid)
-
-
-def _add_image_get_rid(dst_doc, image_bytes, content_type):
+def _add_image_get_rid(dst_doc, image_bytes):
     """Register raw image bytes as a new image part in dst_doc and return
-    the relationship id, using python-docx's internal image machinery
-    directly (works across all python-docx 1.x versions)."""
+    the new relationship id. Tries the modern python-docx API first and
+    falls back to older/alternate method names so this works across
+    python-docx versions."""
     import io
-    from docx.parts.image import ImagePart
-    from docx.opc.part import PartFactory
-    from docx.opc.constants import RELATIONSHIP_TYPE as RT
-
-    image_part = ImagePart.from_image(
-        image=__import__("docx").image.image.Image.from_blob(image_bytes),
-        package=dst_doc.part.package,
-    ) if False else None
-    # Simpler & version-robust approach: use the document's own
-    # image-part cache via get_or_add_image_part (private but stable API
-    # used internally by python-docx for add_picture()).
-    image_part, rid = dst_doc.part.get_or_add_image_part(io.BytesIO(image_bytes))
-    return rid
+    part = dst_doc.part
+    if hasattr(part, "get_or_add_image"):
+        rid, _image = part.get_or_add_image(io.BytesIO(image_bytes))
+        return rid
+    if hasattr(part, "get_or_add_image_part"):
+        # Some older/forked versions return (image_part, rid) instead.
+        result = part.get_or_add_image_part(io.BytesIO(image_bytes))
+        if isinstance(result, tuple):
+            first, second = result
+            return second if isinstance(second, str) else first
+        return result
+    raise RuntimeError(
+        "Installed python-docx version doesn't expose get_or_add_image "
+        "or get_or_add_image_part — run: pip install --upgrade python-docx"
+    )
 
 
 def copy_images(src_doc, dst_doc, element):
-    """Rewrite every image reference inside `element` so it points at a
-    copy of the image inserted into dst_doc."""
-    for attr in (qn("r:embed"), qn("r:link")):
-        for blip in element.iter(qn("a:blip")):
+    """Rewrite every image reference inside `element` (both modern
+    DrawingML pictures via a:blip, and legacy VML images via v:imagedata)
+    so it points at a copy of the image inserted into dst_doc."""
+    # Modern DrawingML images
+    for blip in element.iter(qn("a:blip")):
+        for attr in (qn("r:embed"), qn("r:link")):
             rid = blip.get(attr)
             if not rid:
                 continue
@@ -180,8 +149,27 @@ def copy_images(src_doc, dst_doc, element):
                 image_part = src_doc.part.related_parts[rid]
             except KeyError:
                 continue
-            new_rid = _add_image_get_rid(dst_doc, image_part.blob, image_part.content_type)
+            new_rid = _add_image_get_rid(dst_doc, image_part.blob)
             blip.set(attr, new_rid)
+
+    # Legacy VML images (rare, but some pasted/older screenshots use this).
+    # The 'v' namespace prefix may not be registered at all in documents
+    # that never use VML, so guard the qn() lookups.
+    try:
+        vml_tag = qn("v:imagedata")
+    except KeyError:
+        vml_tag = None
+    if vml_tag is not None:
+        for imagedata in element.iter(vml_tag):
+            rid = imagedata.get(qn("r:id"))
+            if not rid:
+                continue
+            try:
+                image_part = src_doc.part.related_parts[rid]
+            except KeyError:
+                continue
+            new_rid = _add_image_get_rid(dst_doc, image_part.blob)
+            imagedata.set(qn("r:id"), new_rid)
 
 
 def copy_numbering(src_doc, dst_doc, element, numid_map):

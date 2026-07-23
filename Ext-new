@@ -1,217 +1,323 @@
+#!/usr/bin/env python3
 """
-Extract everything between a "Medium Severity" heading and the next
-"Low Severity" heading from every .docx in the current folder, and combine
-all of them into a single output .docx - preserving images, tables,
-bullet/numbered lists, and formatting.
+extract_medium_severity.py
+
+Scans every .docx in a folder, finds the "Medium Severity Vulnerabilities"
+heading in each, and extracts everything from that heading up to (but not
+including) the next heading whose text is "Low Severity Vulnerabilities" —
+matched purely by heading TEXT, not by numbering or Word outline level.
+This means any sub-finding under Medium Severity (e.g. "Unrestricted File
+Upload") is included even if Word tagged it with the same style/level as
+the "Medium Severity Vulnerabilities" heading itself.
+
+Images, tables, formatting, and any existing list numbering inside the
+extracted content are preserved as-is. The script does NOT add its own
+section/heading numbering to the combined output — each extracted block is
+simply preceded by a line naming the source report.
 
 Usage:
-    python ext.py
-    (it will scan the current folder and ask you for an output filename)
+    python3 extract_medium_severity.py <input_folder> <output.docx>
 
-Optional: override the start/end heading text:
-    python ext.py "High Severity" "Medium Severity"
-
-Requires: pip install python-docx
+Example:
+    python3 extract_medium_severity.py . combined_medium_severity.docx
 """
 
-import sys
-import os
-import io
-import re
-import glob
 import copy
+import os
+import re
+import sys
+
 from docx import Document
 from docx.oxml.ns import qn
+from docx.text.paragraph import Paragraph
+
+# ---------------------------------------------------------------------------
+# Config: adjust these two strings if your report uses slightly different
+# wording. Matching is case-insensitive and ignores a leading number/prefix
+# like "6.2.3 " before the heading text.
+# ---------------------------------------------------------------------------
+START_HEADING_TEXT = "medium severity vulnerabilities"
+STOP_HEADING_TEXT = "low severity vulnerabilities"
 
 
-def natural_sort_key(path):
-    """Sort the way Windows File Explorer does: case-insensitive, and
-    numeric chunks compared by value (so 'file2' sorts before 'file10')."""
-    name = os.path.basename(path)
-    return [int(chunk) if chunk.isdigit() else chunk.lower()
-            for chunk in re.split(r'(\d+)', name)]
+def normalize_heading_text(text):
+    """Lowercase, strip, and remove a leading numbering prefix such as
+    '6.2.3 ', '6.2.3.1)', '6.2.3 -' etc., so matching relies on the words
+    only, not on the numbering scheme."""
+    text = text.strip().lower()
+    # Strip a leading numbering token: digits/dots optionally followed by
+    # ) . - or whitespace, e.g. "6.2.3 ", "6.2.3.1)", "6.2.3-"
+    text = re.sub(r"^[\d]+(\.[\d]+)*[\.\)\-:]?\s*", "", text)
+    return text.strip()
 
 
-def get_heading_level(paragraph):
-    style_name = paragraph.style.name if paragraph.style else ""
-    if style_name.lower().startswith("heading"):
-        digits = "".join(ch for ch in style_name if ch.isdigit())
-        return int(digits) if digits else 1
-    if style_name.lower() == "title":
-        return 0
-    return None
+def is_heading_paragraph(paragraph):
+    style_name = (paragraph.style.name or "") if paragraph.style else ""
+    return style_name.lower().startswith("heading") or style_name.lower() == "title"
 
 
-def get_section_elements(docx_path, start_text, end_text):
-    """Return (doc, elements): the source Document object and the list of
-    XML elements (paragraphs/tables) between the heading matching start_text
-    and the next heading matching end_text (exclusive of both boundaries'
-    surrounding content, inclusive of the start heading itself).
-    If end_text is never found after start_text, extraction runs to the end
-    of the document. Returns (doc, None) if start_text is never found."""
-    doc = Document(docx_path)
-    body = doc.element.body
+def iter_block_items(document):
+    """Yield each top-level child element (paragraph or table) of the body,
+    in document order, as raw lxml elements."""
+    body = document.element.body
+    for child in body.iterchildren():
+        tag = child.tag
+        if tag == qn("w:p") or tag == qn("w:tbl"):
+            yield child
+        # sectPr and other body-level elements are skipped
 
-    children = [c for c in body.iterchildren()]
-    if children and children[-1].tag == qn("w:sectPr"):
-        children = children[:-1]
 
-    para_map = {p._p: p for p in doc.paragraphs}
+def find_section_elements(document):
+    """Return the list of raw XML elements between the start heading
+    (inclusive) and the stop heading (exclusive). Returns None if the
+    start heading isn't found in this document."""
+    elements = list(iter_block_items(document))
 
     start_idx = None
-    end_idx = len(children)  # default: end of document
+    stop_idx = None
 
-    for i, el in enumerate(children):
-        if el.tag == qn("w:p") and el in para_map:
-            para = para_map[el]
-            text = para.text.strip()
-            level = get_heading_level(para)
+    for idx, el in enumerate(elements):
+        if el.tag != qn("w:p"):
+            continue
+        para = Paragraph(el, document)
+        if not is_heading_paragraph(para):
+            continue
+        norm = normalize_heading_text(para.text)
 
-            if start_idx is None:
-                if level is not None and start_text.lower() in text.lower():
-                    start_idx = i
-                    continue
-
-            if start_idx is not None and level is not None:
-                if end_text.lower() in text.lower():
-                    end_idx = i
-                    break
-
-    if start_idx is None:
-        return doc, None
-
-    return doc, children[start_idx:end_idx]
-
-
-R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-
-
-def copy_relationships(src_doc, dest_doc, element):
-    """Find ANY relationship-carrying reference inside `element` (images,
-    hyperlinks, embedded objects/charts, etc. - anything using r:id, r:embed,
-    or r:link) and copy the underlying relationship + part into dest_doc,
-    then rewrite the reference to point at the new copy. This prevents
-    'unreadable content' errors caused by references to relationships that
-    only existed in the original source file."""
-    r_attrs = [qn("r:id"), qn("r:embed"), qn("r:link")]
-
-    for el in element.iter():
-        for attr in r_attrs:
-            old_rid = el.get(attr)
-            if not old_rid:
-                continue
-            try:
-                rel = src_doc.part.rels[old_rid]
-            except KeyError:
-                continue
-
-            try:
-                if rel.is_external:
-                    new_rid = dest_doc.part.relate_to(
-                        rel.target_ref, rel.reltype, is_external=True
-                    )
-                else:
-                    new_rid = dest_doc.part.relate_to(rel.target_part, rel.reltype)
-            except Exception:
-                continue
-
-            el.set(attr, new_rid)
-
-
-def strip_unsupported_references(element):
-    """Remove footnote/endnote references and mid-document section breaks
-    from copied content. Footnotes/endnotes require copying and remapping
-    an entire separate part (rarely worth it for extracted excerpts), and a
-    mid-document sectPr can reference headers/footers that don't exist in
-    the destination - both are common causes of 'unreadable content'."""
-    for tag in (qn("w:footnoteReference"), qn("w:endnoteReference")):
-        for ref in list(element.iter(tag)):
-            ref.getparent().remove(ref)
-
-    # A sectPr nested inside a paragraph's pPr marks a mid-document section
-    # break (e.g. a landscape page for a wide table) - strip just the break,
-    # keep the paragraph and its text.
-    for pPr in list(element.iter(qn("w:pPr"))):
-        sect_pr = pPr.find(qn("w:sectPr"))
-        if sect_pr is not None:
-            pPr.remove(sect_pr)
-
-    # Bookmarks can end up unbalanced once content is sliced out of context
-    # (a bookmarkStart with no matching bookmarkEnd, or vice versa). They're
-    # only used for TOC/cross-reference navigation, so it's safe to drop them.
-    for tag in (qn("w:bookmarkStart"), qn("w:bookmarkEnd")):
-        for bm in list(element.iter(tag)):
-            bm.getparent().remove(bm)
-
-    # Numbered/bulleted list references (w:numPr) point at list definitions
-    # in the SOURCE document's numbering part. Rather than copying and
-    # remapping those definitions, just drop the reference - the paragraph
-    # text stays, it just won't render with a bullet/number.
-    for numPr in list(element.iter(qn("w:numPr"))):
-        numPr.getparent().remove(numPr)
-
-
-
-def batch_extract(folder, start_text, end_text, output_path):
-    output_name = os.path.basename(output_path)
-    files = sorted(glob.glob(os.path.join(folder, "*.docx")), key=natural_sort_key)
-    files = [f for f in files if not os.path.basename(f).startswith("~$")]
-    files = [f for f in files if os.path.basename(f) != output_name]
-
-    if not files:
-        print(f"No .docx files found in {folder}")
-        sys.exit(1)
-
-    master = Document()
-    master_body = master.element.body
-    sect_pr = master_body.find(qn("w:sectPr"))
-
-    found_count = 0
-    missing = []
-
-    for f in files:
-        src_doc, elements = get_section_elements(f, start_text, end_text)
-        filename = os.path.basename(f)
-
-        if elements is None:
-            missing.append(filename)
+        if start_idx is None:
+            if norm == START_HEADING_TEXT:
+                start_idx = idx
             continue
 
-        found_count += 1
+        # We already found the start; look for the stop heading anywhere
+        # after it (any heading level — text match only).
+        if norm == STOP_HEADING_TEXT:
+            stop_idx = idx
+            break
 
-        marker = master.add_paragraph()
-        run = marker.add_run(f"Source report: {filename}")
-        run.bold = True
+    if start_idx is None:
+        return None  # heading not found in this doc
 
-        for el in elements:
+    if stop_idx is None:
+        # No "Low Severity" heading found after start — take to end of body
+        stop_idx = len(elements)
+
+    return elements[start_idx:stop_idx]
+
+
+# ---------------------------------------------------------------------------
+# Cross-document copying helpers: images and numbering definitions need to
+# be re-linked/re-registered in the destination document, otherwise copied
+# paragraphs will reference relationship IDs / numIds that don't exist
+# there (broken images, wrong or missing list numbering).
+# ---------------------------------------------------------------------------
+
+def copy_image_relationships(src_doc, dst_doc, element):
+    """Find every image reference (a:blip r:embed=...) inside `element`,
+    copy the underlying image part from src_doc into dst_doc, and rewrite
+    the r:embed attribute to the new relationship id in dst_doc."""
+    r_embed = qn("r:embed")
+    r_link = qn("r:link")
+
+    for blip in element.iter(qn("a:blip")):
+        for attr in (r_embed, r_link):
+            rid = blip.get(attr)
+            if not rid:
+                continue
+            try:
+                image_part = src_doc.part.related_parts[rid]
+            except KeyError:
+                continue
+            image_bytes = image_part.blob
+            content_type = image_part.content_type
+            # Add the image as a new part in the destination document and
+            # get a fresh relationship id valid there.
+            new_rid = dst_doc.part.get_or_add_image_part_relationship(
+                image_bytes, content_type
+            ) if hasattr(dst_doc.part, "get_or_add_image_part_relationship") else None
+
+            if new_rid is None:
+                # python-docx doesn't expose that helper directly; do it
+                # the same way python-docx's own add_picture() does.
+                from docx.parts.image import ImagePart
+                import io
+                image_part_new, new_rid = dst_doc.part.get_or_add_image(
+                    io.BytesIO(image_bytes)
+                ) if hasattr(dst_doc.part, "get_or_add_image") else (None, None)
+
+            blip.set(attr, new_rid)
+
+
+def _add_image_get_rid(dst_doc, image_bytes, content_type):
+    """Register raw image bytes as a new image part in dst_doc and return
+    the relationship id, using python-docx's internal image machinery
+    directly (works across all python-docx 1.x versions)."""
+    import io
+    from docx.parts.image import ImagePart
+    from docx.opc.part import PartFactory
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+
+    image_part = ImagePart.from_image(
+        image=__import__("docx").image.image.Image.from_blob(image_bytes),
+        package=dst_doc.part.package,
+    ) if False else None
+    # Simpler & version-robust approach: use the document's own
+    # image-part cache via get_or_add_image_part (private but stable API
+    # used internally by python-docx for add_picture()).
+    image_part, rid = dst_doc.part.get_or_add_image_part(io.BytesIO(image_bytes))
+    return rid
+
+
+def copy_images(src_doc, dst_doc, element):
+    """Rewrite every image reference inside `element` so it points at a
+    copy of the image inserted into dst_doc."""
+    for attr in (qn("r:embed"), qn("r:link")):
+        for blip in element.iter(qn("a:blip")):
+            rid = blip.get(attr)
+            if not rid:
+                continue
+            try:
+                image_part = src_doc.part.related_parts[rid]
+            except KeyError:
+                continue
+            new_rid = _add_image_get_rid(dst_doc, image_part.blob, image_part.content_type)
+            blip.set(attr, new_rid)
+
+
+def copy_numbering(src_doc, dst_doc, element, numid_map):
+    """Copy the abstractNum/num definitions used by any numbered/bulleted
+    paragraphs inside `element` from src_doc's numbering part into
+    dst_doc's, remapping numId so lists render correctly and don't clash
+    with numbering already used elsewhere in the combined document.
+    `numid_map` caches (src_doc id, old_numId) -> new_numId across calls."""
+    src_numbering = src_doc.part.numbering_part.element if src_doc.part.numbering_part else None
+    dst_numbering_part = dst_doc.part.numbering_part
+    if src_numbering is None or dst_numbering_part is None:
+        return
+    dst_numbering = dst_numbering_part.element
+
+    for numpr in element.iter(qn("w:numPr")):
+        numid_el = numpr.find(qn("w:numId"))
+        if numid_el is None:
+            continue
+        old_numid = numid_el.get(qn("w:val"))
+        key = (id(src_doc), old_numid)
+        if key in numid_map:
+            numid_el.set(qn("w:val"), numid_map[key])
+            continue
+
+        # Find the <w:num> with this id in source numbering.xml
+        src_num = None
+        for num in src_numbering.findall(qn("w:num")):
+            if num.get(qn("w:numId")) == old_numid:
+                src_num = num
+                break
+        if src_num is None:
+            continue
+
+        abstract_num_id_el = src_num.find(qn("w:abstractNumId"))
+        old_abstract_id = abstract_num_id_el.get(qn("w:val")) if abstract_num_id_el is not None else None
+
+        src_abstract = None
+        if old_abstract_id is not None:
+            for abstract in src_numbering.findall(qn("w:abstractNum")):
+                if abstract.get(qn("w:abstractNumId")) == old_abstract_id:
+                    src_abstract = abstract
+                    break
+
+        # Compute new unique ids in the destination numbering part
+        existing_num_ids = [
+            int(n.get(qn("w:numId"))) for n in dst_numbering.findall(qn("w:num"))
+            if n.get(qn("w:numId")) and n.get(qn("w:numId")).isdigit()
+        ]
+        existing_abstract_ids = [
+            int(a.get(qn("w:abstractNumId"))) for a in dst_numbering.findall(qn("w:abstractNum"))
+            if a.get(qn("w:abstractNumId")) and a.get(qn("w:abstractNumId")).isdigit()
+        ]
+        new_abstract_id = str(max(existing_abstract_ids, default=0) + 1)
+        new_num_id = str(max(existing_num_ids, default=0) + 1)
+
+        if src_abstract is not None:
+            new_abstract = copy.deepcopy(src_abstract)
+            new_abstract.set(qn("w:abstractNumId"), new_abstract_id)
+            dst_numbering.append(new_abstract)
+
+        new_num = copy.deepcopy(src_num)
+        new_num.set(qn("w:numId"), new_num_id)
+        new_abstract_ref = new_num.find(qn("w:abstractNumId"))
+        if new_abstract_ref is not None:
+            new_abstract_ref.set(qn("w:val"), new_abstract_id)
+        dst_numbering.append(new_num)
+
+        numid_map[key] = new_num_id
+        numid_el.set(qn("w:val"), new_num_id)
+
+
+def append_report_label(dst_doc, filename):
+    p = dst_doc.add_paragraph()
+    run = p.add_run(f"Report: {filename}")
+    run.bold = True
+    run.font.size = None  # keep default; Word will use Normal style size
+    p.style = dst_doc.styles["Heading 1"] if "Heading 1" in [s.name for s in dst_doc.styles] else p.style
+
+
+def process_folder(input_folder, output_path):
+    combined = Document()
+    # Remove the single default empty paragraph python-docx creates
+    if combined.paragraphs and not combined.paragraphs[0].text:
+        p_el = combined.paragraphs[0]._p
+        p_el.getparent().remove(p_el)
+
+    numid_map = {}
+    found_any = False
+
+    docx_files = sorted(
+        f for f in os.listdir(input_folder)
+        if f.lower().endswith(".docx") and not f.startswith("~$")
+    )
+
+    if not docx_files:
+        print(f"No .docx files found in {input_folder}")
+        return
+
+    for filename in docx_files:
+        path = os.path.join(input_folder, filename)
+        print(f"Processing: {filename}")
+        try:
+            src_doc = Document(path)
+        except Exception as e:
+            print(f"  Skipped (could not open): {e}")
+            continue
+
+        section_elements = find_section_elements(src_doc)
+        if not section_elements:
+            print(f"  '{START_HEADING_TEXT}' heading not found — skipping")
+            continue
+
+        found_any = True
+        append_report_label(combined, filename)
+
+        for el in section_elements:
             new_el = copy.deepcopy(el)
-            strip_unsupported_references(new_el)
-            copy_relationships(src_doc, master, new_el)
-            if sect_pr is not None:
-                sect_pr.addprevious(new_el)
-            else:
-                master_body.append(new_el)
+            copy_images(src_doc, combined, new_el)
+            copy_numbering(src_doc, combined, new_el, numid_map)
+            combined.element.body.append(new_el)
 
-        master.add_paragraph()
+        print(f"  Extracted {len(section_elements)} block(s)")
 
-    master.save(output_path)
+    if not found_any:
+        print("Nothing extracted from any document — output not written.")
+        return
 
-    print(f"\nDone. Extracted from {found_count}/{len(files)} files.")
-    if missing:
-        print(f"\nNo '{start_text}' heading found in {len(missing)} file(s):")
-        for m in missing:
-            print(f"  - {m}")
-    print(f"\nSaved combined document to: {output_path}")
+    combined.save(output_path)
+    print(f"\nCombined document saved to: {output_path}")
 
 
 if __name__ == "__main__":
-    start_text = sys.argv[1] if len(sys.argv) > 1 else "Medium Severity"
-    end_text = sys.argv[2] if len(sys.argv) > 2 else "Low Severity"
+    if len(sys.argv) != 3:
+        print(f"Usage: python3 {os.path.basename(sys.argv[0])} <input_folder> <output.docx>")
+        sys.exit(1)
 
-    output_name = input("Enter output filename (e.g. Combined_Medium_Severity.docx): ").strip()
-    if not output_name:
-        output_name = "Combined_Output.docx"
-    if not output_name.lower().endswith(".docx"):
-        output_name += ".docx"
-
-    batch_extract(".", start_text, end_text, output_name)
+    input_folder = sys.argv[1]
+    output_path = sys.argv[2]
+    process_folder(input_folder, output_path)

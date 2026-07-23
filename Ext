@@ -33,6 +33,34 @@ def get_heading_level(paragraph):
     return None
 
 
+# Section-category names that mark the END of the current severity section
+# even when they share the same heading level as finding titles underneath it
+# (many report templates give every "6.2.x" category AND every "6.2.x.y" finding
+# title the same Heading style, distinguishing them only via numbering text).
+CATEGORY_BOUNDARY_KEYWORDS = [
+    "severity vulnerabilities", "severity findings", "severity issues",
+    "informational vulnerabilities", "informational findings",
+    "conclusion of testing", "conclusion", "appendix",
+    "executive summary", "scope of testing", "out of scope",
+    "methodology", "about application", "about api",
+    "penetration testing coverage", "summary of findings",
+]
+
+
+def is_boundary_heading(text, level, start_level, target_text):
+    """Decide whether this heading marks the end of the target section."""
+    if level < start_level:
+        return True  # moved up in the outline - definitely past the section
+    if level > start_level:
+        return False  # a deeper heading - a sub-item, keep it as content
+    # Same level as the section heading itself: only a real boundary if it
+    # names a DIFFERENT category, not just another finding title underneath it.
+    lowered = text.lower()
+    if target_text.lower() in lowered:
+        return False
+    return any(kw in lowered for kw in CATEGORY_BOUNDARY_KEYWORDS)
+
+
 def copy_images(src_doc, dest_doc, element):
     """Find any images inside `element` (copied from src_doc) and re-embed
     the actual image data into dest_doc, then rewrite the reference so it
@@ -79,9 +107,10 @@ def get_section_elements(docx_path, heading_text):
                     start_level = level
                     continue
 
-            if start_idx is not None and level is not None and level <= start_level:
-                end_idx = i
-                break
+            if start_idx is not None and level is not None:
+                if is_boundary_heading(text, level, start_level, heading_text):
+                    end_idx = i
+                    break
 
     if start_idx is None:
         return doc, None

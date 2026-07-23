@@ -118,6 +118,29 @@ def get_section_elements(docx_path, heading_text):
     return doc, children[start_idx:end_idx]
 
 
+def copy_paragraph(src_para, dest_doc):
+    """Safe paragraph copy via python-docx API to avoid XML corruption."""
+    dest_para = dest_doc.add_paragraph(style=src_para.style)
+    dest_para.paragraph_format.left_indent = src_para.paragraph_format.left_indent
+    dest_para.paragraph_format.right_indent = src_para.paragraph_format.right_indent
+    dest_para.paragraph_format.first_line_indent = src_para.paragraph_format.first_line_indent
+    dest_para.paragraph_format.space_before = src_para.paragraph_format.space_before
+    dest_para.paragraph_format.space_after = src_para.paragraph_format.space_after
+    dest_para.paragraph_format.line_spacing = src_para.paragraph_format.line_spacing
+    
+    for src_run in src_para.runs:
+        dest_run = dest_para.add_run(src_run.text)
+        dest_run.bold = src_run.bold
+        dest_run.italic = src_run.italic
+        dest_run.underline = src_run.underline
+        if src_run.font.size:
+            dest_run.font.size = src_run.font.size
+        if src_run.font.name:
+            dest_run.font.name = src_run.font.name
+        if src_run.font.color.rgb:
+            dest_run.font.color.rgb = src_run.font.color.rgb
+
+
 def batch_extract(folder, heading_text, output_path):
     output_name = os.path.basename(output_path)
     files = sorted(glob.glob(os.path.join(folder, "*.docx")))
@@ -129,8 +152,6 @@ def batch_extract(folder, heading_text, output_path):
         sys.exit(1)
 
     master = Document()  # blank base document to hold combined output
-    master_body = master.element.body
-    sect_pr = master_body.find(qn("w:sectPr"))
 
     found_count = 0
     missing = []
@@ -149,18 +170,23 @@ def batch_extract(folder, heading_text, output_path):
         marker = master.add_paragraph()
         run = marker.add_run(f"Source report: {filename}")
         run.bold = True
-        run.font.size = master.styles["Normal"].font.size
-        marker.paragraph_format.space_before = master.styles["Normal"].paragraph_format.space_before
 
-        # Insert deep copies of the extracted elements before sectPr,
-        # re-embedding any images so they render correctly in the new file
+        # Safe copy: convert elements to paragraphs via python-docx API
         for el in elements:
-            new_el = copy.deepcopy(el)
-            copy_images(src_doc, master, new_el)
-            if sect_pr is not None:
-                sect_pr.addprevious(new_el)
-            else:
-                master_body.append(new_el)
+            if el.tag == qn("w:p"):
+                # Find matching paragraph in src_doc
+                para_match = None
+                for p in src_doc.paragraphs:
+                    if p._p == el:
+                        para_match = p
+                        break
+                if para_match:
+                    copy_paragraph(para_match, master)
+            elif el.tag == qn("w:tbl"):
+                # For tables, deep-copy XML and re-embed images
+                new_el = copy.deepcopy(el)
+                copy_images(src_doc, master, new_el)
+                master.element.body.append(new_el)
 
         # Spacer paragraph between reports
         master.add_paragraph()

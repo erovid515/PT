@@ -1,0 +1,153 @@
+"""
+Extract a heading section (e.g. "Medium Severity") from MANY .docx files
+in a folder, and combine all of them into a single output .docx.
+
+Each source file's extracted section is preceded by a small marker
+paragraph showing which file it came from, so you can trace findings
+back to the original report.
+
+Usage:
+    python extract_section_batch.py "reports_folder" "Medium Severity" "Combined_Medium_Severity.docx"
+
+Run this locally on your own machine - no upload needed.
+Requires: pip install python-docx
+"""
+
+import sys
+import os
+import io
+import glob
+import copy
+from docx import Document
+from docx.oxml.ns import qn
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+
+def get_heading_level(paragraph):
+    style_name = paragraph.style.name if paragraph.style else ""
+    if style_name.lower().startswith("heading"):
+        digits = "".join(ch for ch in style_name if ch.isdigit())
+        return int(digits) if digits else 1
+    if style_name.lower() == "title":
+        return 0
+    return None
+
+
+def copy_images(src_doc, dest_doc, element):
+    """Find any images inside `element` (copied from src_doc) and re-embed
+    the actual image data into dest_doc, then rewrite the reference so it
+    points at the newly-added copy instead of the (missing) original."""
+    for blip in element.iter(qn("a:blip")):
+        embed_id = blip.get(qn("r:embed"))
+        if not embed_id:
+            continue
+        try:
+            image_part = src_doc.part.related_parts[embed_id]
+        except KeyError:
+            continue
+        image_bytes = io.BytesIO(image_part.blob)
+        new_rid, _ = dest_doc.part.get_or_add_image(image_bytes)
+        blip.set(qn("r:embed"), new_rid)
+
+
+def get_section_elements(docx_path, heading_text):
+    """Return (doc, elements): the source Document object and the list of
+    XML elements (paragraphs/tables) that make up the matching heading
+    section, or (doc, None) if not found."""
+    doc = Document(docx_path)
+    body = doc.element.body
+
+    children = [c for c in body.iterchildren()]
+    if children and children[-1].tag == qn("w:sectPr"):
+        children = children[:-1]
+
+    para_map = {p._p: p for p in doc.paragraphs}
+
+    start_idx = None
+    start_level = None
+    end_idx = len(children)
+
+    for i, el in enumerate(children):
+        if el.tag == qn("w:p") and el in para_map:
+            para = para_map[el]
+            text = para.text.strip()
+            level = get_heading_level(para)
+
+            if start_idx is None:
+                if level is not None and heading_text.lower() in text.lower():
+                    start_idx = i
+                    start_level = level
+                    continue
+
+            if start_idx is not None and level is not None and level <= start_level:
+                end_idx = i
+                break
+
+    if start_idx is None:
+        return doc, None
+
+    return doc, children[start_idx:end_idx]
+
+
+def batch_extract(folder, heading_text, output_path):
+    output_name = os.path.basename(output_path)
+    files = sorted(glob.glob(os.path.join(folder, "*.docx")))
+    files = [f for f in files if not os.path.basename(f).startswith("~$")]  # skip Word lock files
+    files = [f for f in files if os.path.basename(f) != output_name]  # skip the output file itself (e.g. on re-runs)
+
+    if not files:
+        print(f"No .docx files found in {folder}")
+        sys.exit(1)
+
+    master = Document()  # blank base document to hold combined output
+    master_body = master.element.body
+    sect_pr = master_body.find(qn("w:sectPr"))
+
+    found_count = 0
+    missing = []
+
+    for f in files:
+        src_doc, elements = get_section_elements(f, heading_text)
+        filename = os.path.basename(f)
+
+        if elements is None:
+            missing.append(filename)
+            continue
+
+        found_count += 1
+
+        # Marker paragraph identifying the source file
+        marker = master.add_paragraph()
+        run = marker.add_run(f"Source report: {filename}")
+        run.bold = True
+        run.font.size = master.styles["Normal"].font.size
+        marker.paragraph_format.space_before = master.styles["Normal"].paragraph_format.space_before
+
+        # Insert deep copies of the extracted elements before sectPr,
+        # re-embedding any images so they render correctly in the new file
+        for el in elements:
+            new_el = copy.deepcopy(el)
+            copy_images(src_doc, master, new_el)
+            if sect_pr is not None:
+                sect_pr.addprevious(new_el)
+            else:
+                master_body.append(new_el)
+
+        # Spacer paragraph between reports
+        master.add_paragraph()
+
+    master.save(output_path)
+
+    print(f"Done. Extracted from {found_count}/{len(files)} files.")
+    if missing:
+        print(f"\nNo '{heading_text}' heading found in {len(missing)} file(s):")
+        for m in missing:
+            print(f"  - {m}")
+    print(f"\nSaved combined document to: {output_path}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 4:
+        print('Usage: python extract_section_batch.py "reports_folder" "Medium Severity" "Combined.docx"')
+        sys.exit(1)
+    batch_extract(sys.argv[1], sys.argv[2], sys.argv[3])

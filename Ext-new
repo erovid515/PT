@@ -1,15 +1,16 @@
 """
-Extract a heading section (e.g. "Medium Severity") from MANY .docx files
-in a folder, and combine all of them into a single output .docx.
-
-Each source file's extracted section is preceded by a small marker
-paragraph showing which file it came from, so you can trace findings
-back to the original report.
+Extract everything between a "Medium Severity" heading and the next
+"Low Severity" heading from every .docx in the current folder, and combine
+all of them into a single output .docx - preserving images, tables,
+bullet/numbered lists, and formatting.
 
 Usage:
-    python extract_section_batch.py "reports_folder" "Medium Severity" "Combined_Medium_Severity.docx"
+    python ext.py
+    (it will scan the current folder and ask you for an output filename)
 
-Run this locally on your own machine - no upload needed.
+Optional: override the start/end heading text:
+    python ext.py "High Severity" "Medium Severity"
+
 Requires: pip install python-docx
 """
 
@@ -20,7 +21,6 @@ import glob
 import copy
 from docx import Document
 from docx.oxml.ns import qn
-from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 
 def get_heading_level(paragraph):
@@ -33,38 +33,51 @@ def get_heading_level(paragraph):
     return None
 
 
-# Section-category names that mark the END of the current severity section
-# even when they share the same heading level as finding titles underneath it
-# (many report templates give every "6.2.x" category AND every "6.2.x.y" finding
-# title the same Heading style, distinguishing them only via numbering text).
-CATEGORY_BOUNDARY_KEYWORDS = [
-    "severity vulnerabilities", "severity findings", "severity issues",
-    "informational vulnerabilities", "informational findings",
-    "conclusion of testing", "conclusion", "appendix",
-    "executive summary", "scope of testing", "out of scope",
-    "methodology", "about application", "about api",
-    "penetration testing coverage", "summary of findings",
-]
+def get_section_elements(docx_path, start_text, end_text):
+    """Return (doc, elements): the source Document object and the list of
+    XML elements (paragraphs/tables) between the heading matching start_text
+    and the next heading matching end_text (exclusive of both boundaries'
+    surrounding content, inclusive of the start heading itself).
+    If end_text is never found after start_text, extraction runs to the end
+    of the document. Returns (doc, None) if start_text is never found."""
+    doc = Document(docx_path)
+    body = doc.element.body
 
+    children = [c for c in body.iterchildren()]
+    if children and children[-1].tag == qn("w:sectPr"):
+        children = children[:-1]
 
-def is_boundary_heading(text, level, start_level, target_text):
-    """Decide whether this heading marks the end of the target section."""
-    if level < start_level:
-        return True  # moved up in the outline - definitely past the section
-    if level > start_level:
-        return False  # a deeper heading - a sub-item, keep it as content
-    # Same level as the section heading itself: only a real boundary if it
-    # names a DIFFERENT category, not just another finding title underneath it.
-    lowered = text.lower()
-    if target_text.lower() in lowered:
-        return False
-    return any(kw in lowered for kw in CATEGORY_BOUNDARY_KEYWORDS)
+    para_map = {p._p: p for p in doc.paragraphs}
+
+    start_idx = None
+    end_idx = len(children)  # default: end of document
+
+    for i, el in enumerate(children):
+        if el.tag == qn("w:p") and el in para_map:
+            para = para_map[el]
+            text = para.text.strip()
+            level = get_heading_level(para)
+
+            if start_idx is None:
+                if level is not None and start_text.lower() in text.lower():
+                    start_idx = i
+                    continue
+
+            if start_idx is not None and level is not None:
+                if end_text.lower() in text.lower():
+                    end_idx = i
+                    break
+
+    if start_idx is None:
+        return doc, None
+
+    return doc, children[start_idx:end_idx]
 
 
 def copy_images(src_doc, dest_doc, element):
-    """Find any images inside `element` (copied from src_doc) and re-embed
-    the actual image data into dest_doc, then rewrite the reference so it
-    points at the newly-added copy instead of the (missing) original."""
+    """Re-embed any images found inside `element` into dest_doc, and rewrite
+    the reference so it points at the new copy instead of the (missing)
+    original relationship."""
     for blip in element.iter(qn("a:blip")):
         embed_id = blip.get(qn("r:embed"))
         if not embed_id:
@@ -78,86 +91,109 @@ def copy_images(src_doc, dest_doc, element):
         blip.set(qn("r:embed"), new_rid)
 
 
-def get_section_elements(docx_path, heading_text):
-    """Return (doc, elements): the source Document object and the list of
-    XML elements (paragraphs/tables) that make up the matching heading
-    section, or (doc, None) if not found."""
-    doc = Document(docx_path)
-    body = doc.element.body
+def _get_numbering_root(doc):
+    """Return the <w:numbering> root element for a document, creating the
+    numbering part if the document doesn't have one yet."""
+    return doc.part.numbering_part.element
 
-    children = [c for c in body.iterchildren()]
-    if children and children[-1].tag == qn("w:sectPr"):
-        children = children[:-1]
 
-    para_map = {p._p: p for p in doc.paragraphs}
+def _insert_abstract_num(root, new_el):
+    """abstractNum elements must all precede num elements per the schema."""
+    existing = root.findall(qn("w:abstractNum"))
+    if existing:
+        existing[-1].addnext(new_el)
+    else:
+        root.insert(0, new_el)
 
-    start_idx = None
-    start_level = None
-    end_idx = len(children)
 
-    for i, el in enumerate(children):
-        if el.tag == qn("w:p") and el in para_map:
-            para = para_map[el]
-            text = para.text.strip()
-            level = get_heading_level(para)
+def copy_numbering(src_doc, dest_doc, element, num_id_map):
+    """Copy any bullet/numbered-list definitions referenced inside `element`
+    from src_doc into dest_doc, remapping numIds so lists from different
+    source reports never collide, then rewrite the references."""
+    numPr_list = list(element.iter(qn("w:numPr")))
+    if not numPr_list:
+        return
 
-            if start_idx is None:
-                if level is not None and heading_text.lower() in text.lower():
-                    start_idx = i
-                    start_level = level
-                    continue
+    src_root = _get_numbering_root(src_doc)
+    dest_root = _get_numbering_root(dest_doc)
 
-            if start_idx is not None and level is not None:
-                if is_boundary_heading(text, level, start_level, heading_text):
-                    end_idx = i
+    for numPr in numPr_list:
+        numId_el = numPr.find(qn("w:numId"))
+        if numId_el is None:
+            continue
+        old_num_id = numId_el.get(qn("w:val"))
+        if old_num_id is None:
+            continue
+
+        key = (id(src_doc), old_num_id)
+        if key in num_id_map:
+            numId_el.set(qn("w:val"), num_id_map[key])
+            continue
+
+        src_num = None
+        for num_el in src_root.findall(qn("w:num")):
+            if num_el.get(qn("w:numId")) == old_num_id:
+                src_num = num_el
+                break
+        if src_num is None:
+            continue
+
+        abstract_ref = src_num.find(qn("w:abstractNumId"))
+        abstract_num_id = abstract_ref.get(qn("w:val")) if abstract_ref is not None else None
+
+        src_abstract = None
+        if abstract_num_id is not None:
+            for a_el in src_root.findall(qn("w:abstractNum")):
+                if a_el.get(qn("w:abstractNumId")) == abstract_num_id:
+                    src_abstract = a_el
                     break
 
-    if start_idx is None:
-        return doc, None
+        existing_abstract_ids = [
+            int(a.get(qn("w:abstractNumId"))) for a in dest_root.findall(qn("w:abstractNum"))
+        ]
+        new_abstract_id = str(max(existing_abstract_ids, default=-1) + 1)
 
-    return doc, children[start_idx:end_idx]
+        existing_num_ids = [
+            int(n.get(qn("w:numId"))) for n in dest_root.findall(qn("w:num"))
+        ]
+        new_num_id = str(max(existing_num_ids, default=0) + 1)
 
+        if src_abstract is not None:
+            new_abstract = copy.deepcopy(src_abstract)
+            new_abstract.set(qn("w:abstractNumId"), new_abstract_id)
+            _insert_abstract_num(dest_root, new_abstract)
 
-def copy_paragraph(src_para, dest_doc):
-    """Safe paragraph copy via python-docx API to avoid XML corruption."""
-    dest_para = dest_doc.add_paragraph(style=src_para.style)
-    dest_para.paragraph_format.left_indent = src_para.paragraph_format.left_indent
-    dest_para.paragraph_format.right_indent = src_para.paragraph_format.right_indent
-    dest_para.paragraph_format.first_line_indent = src_para.paragraph_format.first_line_indent
-    dest_para.paragraph_format.space_before = src_para.paragraph_format.space_before
-    dest_para.paragraph_format.space_after = src_para.paragraph_format.space_after
-    dest_para.paragraph_format.line_spacing = src_para.paragraph_format.line_spacing
-    
-    for src_run in src_para.runs:
-        dest_run = dest_para.add_run(src_run.text)
-        dest_run.bold = src_run.bold
-        dest_run.italic = src_run.italic
-        dest_run.underline = src_run.underline
-        if src_run.font.size:
-            dest_run.font.size = src_run.font.size
-        if src_run.font.name:
-            dest_run.font.name = src_run.font.name
-        if src_run.font.color.rgb:
-            dest_run.font.color.rgb = src_run.font.color.rgb
+        new_num = copy.deepcopy(src_num)
+        new_num.set(qn("w:numId"), new_num_id)
+        new_num_abstract_ref = new_num.find(qn("w:abstractNumId"))
+        if new_num_abstract_ref is not None:
+            new_num_abstract_ref.set(qn("w:val"), new_abstract_id)
+        dest_root.append(new_num)
+
+        num_id_map[key] = new_num_id
+        numId_el.set(qn("w:val"), new_num_id)
 
 
-def batch_extract(folder, heading_text, output_path):
+def batch_extract(folder, start_text, end_text, output_path):
     output_name = os.path.basename(output_path)
     files = sorted(glob.glob(os.path.join(folder, "*.docx")))
-    files = [f for f in files if not os.path.basename(f).startswith("~$")]  # skip Word lock files
-    files = [f for f in files if os.path.basename(f) != output_name]  # skip the output file itself (e.g. on re-runs)
+    files = [f for f in files if not os.path.basename(f).startswith("~$")]
+    files = [f for f in files if os.path.basename(f) != output_name]
 
     if not files:
         print(f"No .docx files found in {folder}")
         sys.exit(1)
 
-    master = Document()  # blank base document to hold combined output
+    master = Document()
+    master_body = master.element.body
+    sect_pr = master_body.find(qn("w:sectPr"))
 
     found_count = 0
     missing = []
+    num_id_map = {}
 
     for f in files:
-        src_doc, elements = get_section_elements(f, heading_text)
+        src_doc, elements = get_section_elements(f, start_text, end_text)
         filename = os.path.basename(f)
 
         if elements is None:
@@ -166,43 +202,39 @@ def batch_extract(folder, heading_text, output_path):
 
         found_count += 1
 
-        # Marker paragraph identifying the source file
         marker = master.add_paragraph()
         run = marker.add_run(f"Source report: {filename}")
         run.bold = True
 
-        # Safe copy: convert elements to paragraphs via python-docx API
         for el in elements:
-            if el.tag == qn("w:p"):
-                # Find matching paragraph in src_doc
-                para_match = None
-                for p in src_doc.paragraphs:
-                    if p._p == el:
-                        para_match = p
-                        break
-                if para_match:
-                    copy_paragraph(para_match, master)
-            elif el.tag == qn("w:tbl"):
-                # For tables, deep-copy XML and re-embed images
-                new_el = copy.deepcopy(el)
-                copy_images(src_doc, master, new_el)
-                master.element.body.append(new_el)
+            new_el = copy.deepcopy(el)
+            copy_images(src_doc, master, new_el)
+            copy_numbering(src_doc, master, new_el, num_id_map)
+            if sect_pr is not None:
+                sect_pr.addprevious(new_el)
+            else:
+                master_body.append(new_el)
 
-        # Spacer paragraph between reports
         master.add_paragraph()
 
     master.save(output_path)
 
-    print(f"Done. Extracted from {found_count}/{len(files)} files.")
+    print(f"\nDone. Extracted from {found_count}/{len(files)} files.")
     if missing:
-        print(f"\nNo '{heading_text}' heading found in {len(missing)} file(s):")
+        print(f"\nNo '{start_text}' heading found in {len(missing)} file(s):")
         for m in missing:
             print(f"  - {m}")
     print(f"\nSaved combined document to: {output_path}")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 4:
-        print('Usage: python extract_section_batch.py "reports_folder" "Medium Severity" "Combined.docx"')
-        sys.exit(1)
-    batch_extract(sys.argv[1], sys.argv[2], sys.argv[3])
+    start_text = sys.argv[1] if len(sys.argv) > 1 else "Medium Severity"
+    end_text = sys.argv[2] if len(sys.argv) > 2 else "Low Severity"
+
+    output_name = input("Enter output filename (e.g. Combined_Medium_Severity.docx): ").strip()
+    if not output_name:
+        output_name = "Combined_Output.docx"
+    if not output_name.lower().endswith(".docx"):
+        output_name += ".docx"
+
+    batch_extract(".", start_text, end_text, output_name)

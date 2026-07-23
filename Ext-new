@@ -17,10 +17,19 @@ Requires: pip install python-docx
 import sys
 import os
 import io
+import re
 import glob
 import copy
 from docx import Document
 from docx.oxml.ns import qn
+
+
+def natural_sort_key(path):
+    """Sort the way Windows File Explorer does: case-insensitive, and
+    numeric chunks compared by value (so 'file2' sorts before 'file10')."""
+    name = os.path.basename(path)
+    return [int(chunk) if chunk.isdigit() else chunk.lower()
+            for chunk in re.split(r'(\d+)', name)]
 
 
 def get_heading_level(paragraph):
@@ -74,109 +83,78 @@ def get_section_elements(docx_path, start_text, end_text):
     return doc, children[start_idx:end_idx]
 
 
-def copy_images(src_doc, dest_doc, element):
-    """Re-embed any images found inside `element` into dest_doc, and rewrite
-    the reference so it points at the new copy instead of the (missing)
-    original relationship."""
-    for blip in element.iter(qn("a:blip")):
-        embed_id = blip.get(qn("r:embed"))
-        if not embed_id:
-            continue
-        try:
-            image_part = src_doc.part.related_parts[embed_id]
-        except KeyError:
-            continue
-        image_bytes = io.BytesIO(image_part.blob)
-        new_rid, _ = dest_doc.part.get_or_add_image(image_bytes)
-        blip.set(qn("r:embed"), new_rid)
+R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 
 
-def _get_numbering_root(doc):
-    """Return the <w:numbering> root element for a document, creating the
-    numbering part if the document doesn't have one yet."""
-    return doc.part.numbering_part.element
+def copy_relationships(src_doc, dest_doc, element):
+    """Find ANY relationship-carrying reference inside `element` (images,
+    hyperlinks, embedded objects/charts, etc. - anything using r:id, r:embed,
+    or r:link) and copy the underlying relationship + part into dest_doc,
+    then rewrite the reference to point at the new copy. This prevents
+    'unreadable content' errors caused by references to relationships that
+    only existed in the original source file."""
+    r_attrs = [qn("r:id"), qn("r:embed"), qn("r:link")]
+
+    for el in element.iter():
+        for attr in r_attrs:
+            old_rid = el.get(attr)
+            if not old_rid:
+                continue
+            try:
+                rel = src_doc.part.rels[old_rid]
+            except KeyError:
+                continue
+
+            try:
+                if rel.is_external:
+                    new_rid = dest_doc.part.relate_to(
+                        rel.target_ref, rel.reltype, is_external=True
+                    )
+                else:
+                    new_rid = dest_doc.part.relate_to(rel.target_part, rel.reltype)
+            except Exception:
+                continue
+
+            el.set(attr, new_rid)
 
 
-def _insert_abstract_num(root, new_el):
-    """abstractNum elements must all precede num elements per the schema."""
-    existing = root.findall(qn("w:abstractNum"))
-    if existing:
-        existing[-1].addnext(new_el)
-    else:
-        root.insert(0, new_el)
+def strip_unsupported_references(element):
+    """Remove footnote/endnote references and mid-document section breaks
+    from copied content. Footnotes/endnotes require copying and remapping
+    an entire separate part (rarely worth it for extracted excerpts), and a
+    mid-document sectPr can reference headers/footers that don't exist in
+    the destination - both are common causes of 'unreadable content'."""
+    for tag in (qn("w:footnoteReference"), qn("w:endnoteReference")):
+        for ref in list(element.iter(tag)):
+            ref.getparent().remove(ref)
 
+    # A sectPr nested inside a paragraph's pPr marks a mid-document section
+    # break (e.g. a landscape page for a wide table) - strip just the break,
+    # keep the paragraph and its text.
+    for pPr in list(element.iter(qn("w:pPr"))):
+        sect_pr = pPr.find(qn("w:sectPr"))
+        if sect_pr is not None:
+            pPr.remove(sect_pr)
 
-def copy_numbering(src_doc, dest_doc, element, num_id_map):
-    """Copy any bullet/numbered-list definitions referenced inside `element`
-    from src_doc into dest_doc, remapping numIds so lists from different
-    source reports never collide, then rewrite the references."""
-    numPr_list = list(element.iter(qn("w:numPr")))
-    if not numPr_list:
-        return
+    # Bookmarks can end up unbalanced once content is sliced out of context
+    # (a bookmarkStart with no matching bookmarkEnd, or vice versa). They're
+    # only used for TOC/cross-reference navigation, so it's safe to drop them.
+    for tag in (qn("w:bookmarkStart"), qn("w:bookmarkEnd")):
+        for bm in list(element.iter(tag)):
+            bm.getparent().remove(bm)
 
-    src_root = _get_numbering_root(src_doc)
-    dest_root = _get_numbering_root(dest_doc)
+    # Numbered/bulleted list references (w:numPr) point at list definitions
+    # in the SOURCE document's numbering part. Rather than copying and
+    # remapping those definitions, just drop the reference - the paragraph
+    # text stays, it just won't render with a bullet/number.
+    for numPr in list(element.iter(qn("w:numPr"))):
+        numPr.getparent().remove(numPr)
 
-    for numPr in numPr_list:
-        numId_el = numPr.find(qn("w:numId"))
-        if numId_el is None:
-            continue
-        old_num_id = numId_el.get(qn("w:val"))
-        if old_num_id is None:
-            continue
-
-        key = (id(src_doc), old_num_id)
-        if key in num_id_map:
-            numId_el.set(qn("w:val"), num_id_map[key])
-            continue
-
-        src_num = None
-        for num_el in src_root.findall(qn("w:num")):
-            if num_el.get(qn("w:numId")) == old_num_id:
-                src_num = num_el
-                break
-        if src_num is None:
-            continue
-
-        abstract_ref = src_num.find(qn("w:abstractNumId"))
-        abstract_num_id = abstract_ref.get(qn("w:val")) if abstract_ref is not None else None
-
-        src_abstract = None
-        if abstract_num_id is not None:
-            for a_el in src_root.findall(qn("w:abstractNum")):
-                if a_el.get(qn("w:abstractNumId")) == abstract_num_id:
-                    src_abstract = a_el
-                    break
-
-        existing_abstract_ids = [
-            int(a.get(qn("w:abstractNumId"))) for a in dest_root.findall(qn("w:abstractNum"))
-        ]
-        new_abstract_id = str(max(existing_abstract_ids, default=-1) + 1)
-
-        existing_num_ids = [
-            int(n.get(qn("w:numId"))) for n in dest_root.findall(qn("w:num"))
-        ]
-        new_num_id = str(max(existing_num_ids, default=0) + 1)
-
-        if src_abstract is not None:
-            new_abstract = copy.deepcopy(src_abstract)
-            new_abstract.set(qn("w:abstractNumId"), new_abstract_id)
-            _insert_abstract_num(dest_root, new_abstract)
-
-        new_num = copy.deepcopy(src_num)
-        new_num.set(qn("w:numId"), new_num_id)
-        new_num_abstract_ref = new_num.find(qn("w:abstractNumId"))
-        if new_num_abstract_ref is not None:
-            new_num_abstract_ref.set(qn("w:val"), new_abstract_id)
-        dest_root.append(new_num)
-
-        num_id_map[key] = new_num_id
-        numId_el.set(qn("w:val"), new_num_id)
 
 
 def batch_extract(folder, start_text, end_text, output_path):
     output_name = os.path.basename(output_path)
-    files = sorted(glob.glob(os.path.join(folder, "*.docx")))
+    files = sorted(glob.glob(os.path.join(folder, "*.docx")), key=natural_sort_key)
     files = [f for f in files if not os.path.basename(f).startswith("~$")]
     files = [f for f in files if os.path.basename(f) != output_name]
 
@@ -190,7 +168,6 @@ def batch_extract(folder, start_text, end_text, output_path):
 
     found_count = 0
     missing = []
-    num_id_map = {}
 
     for f in files:
         src_doc, elements = get_section_elements(f, start_text, end_text)
@@ -208,8 +185,8 @@ def batch_extract(folder, start_text, end_text, output_path):
 
         for el in elements:
             new_el = copy.deepcopy(el)
-            copy_images(src_doc, master, new_el)
-            copy_numbering(src_doc, master, new_el, num_id_map)
+            strip_unsupported_references(new_el)
+            copy_relationships(src_doc, master, new_el)
             if sect_pr is not None:
                 sect_pr.addprevious(new_el)
             else:

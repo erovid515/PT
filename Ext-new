@@ -45,8 +45,6 @@ def normalize_heading_text(text):
     '6.2.3 ', '6.2.3.1)', '6.2.3 -' etc., so matching relies on the words
     only, not on the numbering scheme."""
     text = text.strip().lower()
-    # Strip a leading numbering token: digits/dots optionally followed by
-    # ) . - or whitespace, e.g. "6.2.3 ", "6.2.3.1)", "6.2.3-"
     text = re.sub(r"^[\d]+(\.[\d]+)*[\.\)\-:]?\s*", "", text)
     return text.strip()
 
@@ -64,7 +62,6 @@ def iter_block_items(document):
         tag = child.tag
         if tag == qn("w:p") or tag == qn("w:tbl"):
             yield child
-        # sectPr and other body-level elements are skipped
 
 
 def find_section_elements(document):
@@ -89,17 +86,14 @@ def find_section_elements(document):
                 start_idx = idx
             continue
 
-        # We already found the start; look for the stop heading anywhere
-        # after it (any heading level — text match only).
         if norm == STOP_HEADING_TEXT:
             stop_idx = idx
             break
 
     if start_idx is None:
-        return None  # heading not found in this doc
+        return None
 
     if stop_idx is None:
-        # No "Low Severity" heading found after start — take to end of body
         stop_idx = len(elements)
 
     return elements[start_idx:stop_idx]
@@ -123,7 +117,6 @@ def _add_image_get_rid(dst_doc, image_bytes):
         rid, _image = part.get_or_add_image(io.BytesIO(image_bytes))
         return rid
     if hasattr(part, "get_or_add_image_part"):
-        # Some older/forked versions return (image_part, rid) instead.
         result = part.get_or_add_image_part(io.BytesIO(image_bytes))
         if isinstance(result, tuple):
             first, second = result
@@ -153,8 +146,6 @@ def copy_images(src_doc, dst_doc, element):
             blip.set(attr, new_rid)
 
     # Legacy VML images (rare, but some pasted/older screenshots use this).
-    # The 'v' namespace prefix may not be registered at all in documents
-    # that never use VML, so guard the qn() lookups.
     try:
         vml_tag = qn("v:imagedata")
     except KeyError:
@@ -194,7 +185,6 @@ def copy_numbering(src_doc, dst_doc, element, numid_map):
             numid_el.set(qn("w:val"), numid_map[key])
             continue
 
-        # Find the <w:num> with this id in source numbering.xml
         src_num = None
         for num in src_numbering.findall(qn("w:num")):
             if num.get(qn("w:numId")) == old_numid:
@@ -213,7 +203,6 @@ def copy_numbering(src_doc, dst_doc, element, numid_map):
                     src_abstract = abstract
                     break
 
-        # Compute new unique ids in the destination numbering part
         existing_num_ids = [
             int(n.get(qn("w:numId"))) for n in dst_numbering.findall(qn("w:num"))
             if n.get(qn("w:numId")) and n.get(qn("w:numId")).isdigit()
@@ -245,13 +234,11 @@ def append_report_label(dst_doc, filename):
     p = dst_doc.add_paragraph()
     run = p.add_run(f"Report: {filename}")
     run.bold = True
-    run.font.size = None  # keep default; Word will use Normal style size
     p.style = dst_doc.styles["Heading 1"] if "Heading 1" in [s.name for s in dst_doc.styles] else p.style
 
 
 def process_folder(input_folder, output_path):
     combined = Document()
-    # Remove the single default empty paragraph python-docx creates
     if combined.paragraphs and not combined.paragraphs[0].text:
         p_el = combined.paragraphs[0]._p
         p_el.getparent().remove(p_el)

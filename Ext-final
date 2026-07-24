@@ -10,10 +10,14 @@ This means any sub-finding under Medium Severity (e.g. "Unrestricted File
 Upload") is included even if Word tagged it with the same style/level as
 the "Medium Severity Vulnerabilities" heading itself.
 
-Images, tables, formatting, and any existing list numbering inside the
-extracted content are preserved as-is. The script does NOT add its own
-section/heading numbering to the combined output — each extracted block is
-simply preceded by a line naming the source report.
+Images, tables, formatting, and any existing list numbering INSIDE THE BODY
+CONTENT (e.g. numbered steps, bullet lists) are preserved as-is. However,
+any numbering on the HEADINGS THEMSELVES (e.g. "6.3.2.1 Unrestricted File
+Upload") is stripped from the final output — both literal typed numbers
+and Word's automatic multilevel-list numbering on heading paragraphs.
+
+Files are processed in natural sort order (the same order Windows File
+Explorer uses — "report2" before "report10"), not plain alphabetical order.
 
 Usage:
     python3 extract_medium_severity.py <input_folder> <output.docx>
@@ -31,19 +35,25 @@ from docx import Document
 from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
 
-# ---------------------------------------------------------------------------
-# Config: adjust these two strings if your report uses slightly different
-# wording. Matching is case-insensitive and ignores a leading number/prefix
-# like "6.2.3 " before the heading text.
-# ---------------------------------------------------------------------------
 START_HEADING_TEXT = "medium severity vulnerabilities"
 STOP_HEADING_TEXT = "low severity vulnerabilities"
 
+# Matches a leading numbering prefix on a heading, e.g.:
+#   "6.3.2.1 Unrestricted File Upload"  -> strips "6.3.2.1 "
+#   "6.3.2.1) Unrestricted File Upload" -> strips "6.3.2.1) "
+#   "6.3.2.1: Unrestricted File Upload" -> strips "6.3.2.1: "
+HEADING_NUM_PREFIX_RE = re.compile(r"^[\d]+(\.[\d]+)*[\.\)\-:]?[\s\t]*")
+
+
+def natural_sort_key(filename):
+    """Split filename into alternating text/number chunks so numbers sort
+    numerically instead of lexicographically — matches Windows File
+    Explorer's sort order (e.g. 'Report 2.docx' before 'Report 10.docx')."""
+    parts = re.split(r"(\d+)", filename)
+    return [int(part) if part.isdigit() else part.lower() for part in parts]
+
 
 def normalize_heading_text(text):
-    """Lowercase, strip, and remove a leading numbering prefix such as
-    '6.2.3 ', '6.2.3.1)', '6.2.3 -' etc., so matching relies on the words
-    only, not on the numbering scheme."""
     text = text.strip().lower()
     text = re.sub(r"^[\d]+(\.[\d]+)*[\.\)\-:]?\s*", "", text)
     return text.strip()
@@ -55,8 +65,6 @@ def is_heading_paragraph(paragraph):
 
 
 def iter_block_items(document):
-    """Yield each top-level child element (paragraph or table) of the body,
-    in document order, as raw lxml elements."""
     body = document.element.body
     for child in body.iterchildren():
         tag = child.tag
@@ -65,11 +73,7 @@ def iter_block_items(document):
 
 
 def find_section_elements(document):
-    """Return the list of raw XML elements between the start heading
-    (inclusive) and the stop heading (exclusive). Returns None if the
-    start heading isn't found in this document."""
     elements = list(iter_block_items(document))
-
     start_idx = None
     stop_idx = None
 
@@ -92,25 +96,12 @@ def find_section_elements(document):
 
     if start_idx is None:
         return None
-
     if stop_idx is None:
         stop_idx = len(elements)
-
     return elements[start_idx:stop_idx]
 
 
-# ---------------------------------------------------------------------------
-# Cross-document copying helpers: images and numbering definitions need to
-# be re-linked/re-registered in the destination document, otherwise copied
-# paragraphs will reference relationship IDs / numIds that don't exist
-# there (broken images, wrong or missing list numbering).
-# ---------------------------------------------------------------------------
-
 def _add_image_get_rid(dst_doc, image_bytes):
-    """Register raw image bytes as a new image part in dst_doc and return
-    the new relationship id. Tries the modern python-docx API first and
-    falls back to older/alternate method names so this works across
-    python-docx versions."""
     import io
     part = dst_doc.part
     if hasattr(part, "get_or_add_image"):
@@ -129,10 +120,6 @@ def _add_image_get_rid(dst_doc, image_bytes):
 
 
 def copy_images(src_doc, dst_doc, element):
-    """Rewrite every image reference inside `element` (both modern
-    DrawingML pictures via a:blip, and legacy VML images via v:imagedata)
-    so it points at a copy of the image inserted into dst_doc."""
-    # Modern DrawingML images
     for blip in element.iter(qn("a:blip")):
         for attr in (qn("r:embed"), qn("r:link")):
             rid = blip.get(attr)
@@ -145,7 +132,6 @@ def copy_images(src_doc, dst_doc, element):
             new_rid = _add_image_get_rid(dst_doc, image_part.blob)
             blip.set(attr, new_rid)
 
-    # Legacy VML images (rare, but some pasted/older screenshots use this).
     try:
         vml_tag = qn("v:imagedata")
     except KeyError:
@@ -164,11 +150,6 @@ def copy_images(src_doc, dst_doc, element):
 
 
 def copy_numbering(src_doc, dst_doc, element, numid_map):
-    """Copy the abstractNum/num definitions used by any numbered/bulleted
-    paragraphs inside `element` from src_doc's numbering part into
-    dst_doc's, remapping numId so lists render correctly and don't clash
-    with numbering already used elsewhere in the combined document.
-    `numid_map` caches (src_doc id, old_numId) -> new_numId across calls."""
     src_numbering = src_doc.part.numbering_part.element if src_doc.part.numbering_part else None
     dst_numbering_part = dst_doc.part.numbering_part
     if src_numbering is None or dst_numbering_part is None:
@@ -230,6 +211,49 @@ def copy_numbering(src_doc, dst_doc, element, numid_map):
         numid_el.set(qn("w:val"), new_num_id)
 
 
+def _remove_leading_chars(paragraph_el, n):
+    """Delete the first n characters of visible text from a paragraph,
+    walking across however many <w:r>/<w:t> runs the prefix spans."""
+    remaining = n
+    for r in paragraph_el.findall(qn("w:r")):
+        if remaining <= 0:
+            break
+        for t in r.findall(qn("w:t")):
+            if remaining <= 0:
+                break
+            text = t.text or ""
+            if not text:
+                continue
+            if len(text) <= remaining:
+                remaining -= len(text)
+                t.text = ""
+            else:
+                t.text = text[remaining:]
+                remaining = 0
+
+
+def strip_heading_numbering(paragraph_el, document):
+    """For a heading paragraph, remove any Word auto-numbering (numPr) and
+    strip a leading literal numbering prefix (e.g. '6.3.2.1 ') from the
+    visible text, so the final document shows no heading numbers at all."""
+    para = Paragraph(paragraph_el, document)
+    if not is_heading_paragraph(para):
+        return
+
+    # 1) Disable Word's automatic multilevel-list numbering on this heading
+    pPr = paragraph_el.find(qn("w:pPr"))
+    if pPr is not None:
+        numPr = pPr.find(qn("w:numPr"))
+        if numPr is not None:
+            pPr.remove(numPr)
+
+    # 2) Strip a literal typed numbering prefix from the heading text
+    full_text = para.text
+    match = HEADING_NUM_PREFIX_RE.match(full_text)
+    if match and match.group(0):
+        _remove_leading_chars(paragraph_el, len(match.group(0)))
+
+
 def append_report_label(dst_doc, filename):
     p = dst_doc.add_paragraph()
     run = p.add_run(f"Report: {filename}")
@@ -247,8 +271,9 @@ def process_folder(input_folder, output_path):
     found_any = False
 
     docx_files = sorted(
-        f for f in os.listdir(input_folder)
-        if f.lower().endswith(".docx") and not f.startswith("~$")
+        (f for f in os.listdir(input_folder)
+         if f.lower().endswith(".docx") and not f.startswith("~$")),
+        key=natural_sort_key
     )
 
     if not docx_files:
@@ -276,6 +301,8 @@ def process_folder(input_folder, output_path):
             new_el = copy.deepcopy(el)
             copy_images(src_doc, combined, new_el)
             copy_numbering(src_doc, combined, new_el, numid_map)
+            if new_el.tag == qn("w:p"):
+                strip_heading_numbering(new_el, combined)
             combined.element.body.append(new_el)
 
         print(f"  Extracted {len(section_elements)} block(s)")

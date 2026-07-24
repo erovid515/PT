@@ -1,0 +1,131 @@
+Option Explicit
+
+Sub ExtractMediumSeverityAll()
+
+    Const START_TEXT As String = "medium severity vulnerabilities"
+    Const STOP_TEXT As String = "low severity vulnerabilities"
+
+    Dim fd As FileDialog
+    Dim inputFolder As String
+    Dim outputPath As String
+    Dim destDoc As Document
+    Dim srcDoc As Document
+    Dim fileName As String
+    Dim foundAny As Boolean
+
+    Set fd = Application.FileDialog(msoFileDialogFolderPicker)
+    fd.Title = "Select folder containing the .docx reports"
+    If fd.Show <> -1 Then
+        MsgBox "No folder selected — cancelled.", vbExclamation
+        Exit Sub
+    End If
+    inputFolder = fd.SelectedItems(1)
+    If Right(inputFolder, 1) <> "\" Then inputFolder = inputFolder & "\"
+    outputPath = inputFolder & "Combined_Medium_Severity.docx"
+
+    Set destDoc = Documents.Add
+    foundAny = False
+
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = wdAlertsNone
+
+    fileName = Dir(inputFolder & "*.docx")
+
+    Do While fileName <> ""
+        If Left(fileName, 2) <> "~$" And LCase(fileName) <> "combined_medium_severity.docx" Then
+
+            Set srcDoc = Documents.Open(FileName:=inputFolder & fileName, _
+                ReadOnly:=True, AddToRecentFiles:=False, Visible:=False)
+
+            Dim startPara As Paragraph, stopPara As Paragraph
+            Dim p As Paragraph
+            Dim foundStart As Boolean
+            Set startPara = Nothing
+            Set stopPara = Nothing
+            foundStart = False
+
+            For Each p In srcDoc.Paragraphs
+                If IsHeadingParagraph(p) Then
+                    Dim normText As String
+                    normText = NormalizeHeadingText(p.Range.Text)
+                    If Not foundStart Then
+                        If normText = START_TEXT Then
+                            Set startPara = p
+                            foundStart = True
+                        End If
+                    Else
+                        If normText = STOP_TEXT Then
+                            Set stopPara = p
+                            Exit For
+                        End If
+                    End If
+                End If
+            Next p
+
+            If Not startPara Is Nothing Then
+                foundAny = True
+
+                Dim extractRange As Range
+                If Not stopPara Is Nothing Then
+                    Set extractRange = srcDoc.Range(Start:=startPara.Range.Start, End:=stopPara.Range.Start)
+                Else
+                    Set extractRange = srcDoc.Range(Start:=startPara.Range.Start, End:=srcDoc.Content.End)
+                End If
+
+                Dim destRange As Range
+
+                ' Insert "Report: filename" as a Heading 1
+                Set destRange = destDoc.Range(destDoc.Content.End - 1, destDoc.Content.End - 1)
+                destRange.Text = "Report: " & fileName & vbCr
+                destRange.Paragraphs(1).Style = destDoc.Styles(wdStyleHeading1)
+
+                ' Copy the extracted content in with full formatting (images, tables, numbering)
+                Set destRange = destDoc.Range(destDoc.Content.End - 1, destDoc.Content.End - 1)
+                destRange.FormattedText = extractRange.FormattedText
+
+                ' Blank line between sections
+                Set destRange = destDoc.Range(destDoc.Content.End - 1, destDoc.Content.End - 1)
+                destRange.InsertParagraphAfter
+
+            End If
+
+            srcDoc.Close SaveChanges:=False
+        End If
+        fileName = Dir
+    Loop
+
+    Application.ScreenUpdating = True
+    Application.DisplayAlerts = wdAlertsAll
+
+    If foundAny Then
+        destDoc.SaveAs2 FileName:=outputPath, FileFormat:=wdFormatXMLDocument
+        MsgBox "Done. Combined document saved to:" & vbCrLf & outputPath, vbInformation
+    Else
+        destDoc.Close SaveChanges:=False
+        MsgBox "No '" & START_TEXT & "' heading found in any document.", vbExclamation
+    End If
+
+End Sub
+
+Private Function IsHeadingParagraph(p As Paragraph) As Boolean
+    Dim styleName As String
+    On Error Resume Next
+    styleName = p.Style.NameLocal
+    On Error GoTo 0
+    IsHeadingParagraph = (InStr(1, LCase(styleName), "heading") = 1) Or (LCase(styleName) = "title")
+End Function
+
+Private Function NormalizeHeadingText(txt As String) As String
+    Dim t As String
+    t = Replace(txt, vbCr, "")
+    t = Replace(t, Chr(7), "")
+    t = Trim(LCase(t))
+
+    Dim re As Object
+    Set re = CreateObject("VBScript.RegExp")
+    re.Pattern = "^[0-9]+(\.[0-9]+)*[\.\)\-:]?\s*"
+    re.Global = False
+    t = re.Replace(t, "")
+
+    NormalizeHeadingText = Trim(t)
+End Function
